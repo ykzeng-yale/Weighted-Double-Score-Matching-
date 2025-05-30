@@ -1,0 +1,1394 @@
+// ============================================================================
+// COMPLETE SURVEY-WEIGHTED DOUBLE SCORE MATCHING (WDSM) IMPLEMENTATION
+// Based on extended Yang & Zhang (2020) framework for survey data
+// ============================================================================
+
+/**
+ * Complete implementation of Survey-Weighted Double Score Matching
+ * 
+ * Key Features:
+ * - Multiple robustness through candidate models
+ * - Three-stage optimal weight incorporation
+ * - Cross-fitting for bias reduction
+ * - Two-stage bootstrap for variance estimation
+ * - Quantile treatment effects
+ * - Comprehensive diagnostics
+ */
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Generate standard normal random variable using Box-Muller transform
+ */
+function normalRandom() {
+    let u = 0, v = 0;
+    while(u === 0) u = Math.random();
+    while(v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+/**
+ * Generate exponential random variable
+ */
+function exponentialRandom() {
+    return -Math.log(1 - Math.random());
+}
+
+/**
+ * Logistic function with numerical stability
+ */
+function logistic(x) {
+    const clippedX = Math.max(-10, Math.min(10, x));
+    return 1 / (1 + Math.exp(-clippedX));
+}
+
+/**
+ * Calculate weighted mean
+ */
+function weightedMean(values, weights) {
+    let sumWeighted = 0;
+    let sumWeights = 0;
+    for (let i = 0; i < values.length; i++) {
+        if (!isNaN(values[i]) && !isNaN(weights[i]) && weights[i] > 0) {
+            sumWeighted += values[i] * weights[i];
+            sumWeights += weights[i];
+        }
+    }
+    return sumWeights > 0 ? sumWeighted / sumWeights : 0;
+}
+
+/**
+ * Calculate weighted variance
+ */
+function weightedVariance(values, weights, mean = null) {
+    if (mean === null) {
+        mean = weightedMean(values, weights);
+    }
+    
+    let sumWeightedSq = 0;
+    let sumWeights = 0;
+    
+    for (let i = 0; i < values.length; i++) {
+        if (!isNaN(values[i]) && !isNaN(weights[i]) && weights[i] > 0) {
+            sumWeightedSq += weights[i] * Math.pow(values[i] - mean, 2);
+            sumWeights += weights[i];
+        }
+    }
+    
+    return sumWeights > 0 ? sumWeightedSq / sumWeights : 0;
+}
+
+/**
+ * Calculate weighted covariance matrix
+ */
+function weightedCovariance(X, weights) {
+    const n = X.length;
+    const p = X[0].length;
+    
+    // Calculate weighted means
+    const means = [];
+    for (let j = 0; j < p; j++) {
+        const col = X.map(row => row[j]);
+        means.push(weightedMean(col, weights));
+    }
+    
+    // Calculate covariance matrix
+    const cov = Array(p).fill().map(() => Array(p).fill(0));
+    let sumWeights = 0;
+    
+    for (let i = 0; i < n; i++) {
+        const w = weights[i];
+        sumWeights += w;
+        
+        for (let j = 0; j < p; j++) {
+            for (let k = j; k < p; k++) {
+                cov[j][k] += w * (X[i][j] - means[j]) * (X[i][k] - means[k]);
+            }
+        }
+    }
+    
+    // Normalize and symmetrize
+    for (let j = 0; j < p; j++) {
+        for (let k = j; k < p; k++) {
+            cov[j][k] /= sumWeights;
+            cov[k][j] = cov[j][k];
+        }
+    }
+    
+    return cov;
+}
+
+/**
+ * Calculate effective sample size
+ */
+function effectiveSampleSize(weights) {
+    const sumW = weights.reduce((a, b) => a + b, 0);
+    const sumW2 = weights.reduce((sum, w) => sum + w * w, 0);
+    return sumW * sumW / sumW2;
+}
+
+/**
+ * Calculate weighted quantile
+ */
+function weightedQuantile(values, weights, q) {
+    // Sort values and weights together
+    const paired = values.map((v, i) => ({ value: v, weight: weights[i] }));
+    paired.sort((a, b) => a.value - b.value);
+    
+    // Calculate cumulative weight
+    const totalWeight = weights.reduce((a, b) => a + b, 0);
+    let cumWeight = 0;
+    
+    for (let i = 0; i < paired.length; i++) {
+        cumWeight += paired[i].weight;
+        if (cumWeight / totalWeight >= q) {
+            return paired[i].value;
+        }
+    }
+    
+    return paired[paired.length - 1].value;
+}
+
+// ============================================================================
+// SCORE ESTIMATION MODELS
+// ============================================================================
+
+/**
+ * Base class for score models
+ */
+class ScoreModel {
+    constructor(name, type) {
+        this.name = name;
+        this.type = type; // 'propensity' or 'outcome'
+    }
+    
+    fit(X, Y, weights, options = {}) {
+        throw new Error('fit method must be implemented by subclass');
+    }
+    
+    predict(X) {
+        throw new Error('predict method must be implemented by subclass');
+    }
+}
+
+/**
+ * Weighted logistic regression for propensity scores
+ */
+class WeightedLogisticRegression extends ScoreModel {
+    constructor(options = {}) {
+        super('logistic', 'propensity');
+        this.lambda = options.lambda || 0.01;
+        this.maxIter = options.maxIter || 25;
+        this.tolerance = options.tolerance || 1e-6;
+        this.includeInteractions = options.includeInteractions || false;
+    }
+    
+    fit(X, Y, weights, options = {}) {
+        const n = X.length;
+        const p = X[0].length;
+        
+        // Add intercept and optionally interactions
+        const XDesign = this.createDesignMatrix(X);
+        const pDesign = XDesign[0].length;
+        
+        // Initialize parameters
+        this.beta = Array(pDesign).fill(0);
+        const propWeighted = weightedMean(Y, weights);
+        this.beta[0] = Math.log(propWeighted / (1 - propWeighted));
+        
+        // Newton-Raphson iterations
+        for (let iter = 0; iter < this.maxIter; iter++) {
+            const { score, hessian } = this.computeScoreHessian(XDesign, Y, weights);
+            
+            // Update parameters
+            const maxChange = this.updateParameters(score, hessian);
+            
+            if (maxChange < this.tolerance) {
+                this.converged = true;
+                break;
+            }
+        }
+        
+        return this;
+    }
+    
+    createDesignMatrix(X) {
+        const n = X.length;
+        const p = X[0].length;
+        const XDesign = [];
+        
+        for (let i = 0; i < n; i++) {
+            const row = [1, ...X[i]]; // Intercept + main effects
+            
+            if (this.includeInteractions && p >= 2) {
+                // Add selected interactions
+                row.push(X[i][0] * X[i][1]);
+                if (p >= 3) {
+                    row.push(X[i][0] * X[i][2]);
+                    row.push(X[i][1] * X[i][2]);
+                }
+            }
+            
+            XDesign.push(row);
+        }
+        
+        return XDesign;
+    }
+    
+    computeScoreHessian(X, Y, weights) {
+        const n = X.length;
+        const p = X[0].length;
+        
+        const score = Array(p).fill(0);
+        const hessian = Array(p).fill().map(() => Array(p).fill(0));
+        
+        for (let i = 0; i < n; i++) {
+            const xi = X[i];
+            const eta = this.linearPredictor(xi);
+            const pi = logistic(eta);
+            const w = weights[i];
+            
+            // Score function
+            for (let j = 0; j < p; j++) {
+                score[j] += w * xi[j] * (Y[i] - pi);
+                if (j > 0) score[j] -= this.lambda * this.beta[j]; // L2 regularization
+            }
+            
+            // Hessian matrix
+            const variance = pi * (1 - pi);
+            for (let j = 0; j < p; j++) {
+                for (let k = 0; k < p; k++) {
+                    hessian[j][k] -= w * xi[j] * xi[k] * variance;
+                    if (j === k && j > 0) hessian[j][k] -= this.lambda;
+                }
+            }
+        }
+        
+        return { score, hessian };
+    }
+    
+    linearPredictor(x) {
+        let eta = 0;
+        for (let j = 0; j < this.beta.length && j < x.length; j++) {
+            eta += this.beta[j] * x[j];
+        }
+        return Math.max(-10, Math.min(10, eta));
+    }
+    
+    updateParameters(score, hessian) {
+        const p = score.length;
+        const maxStepSize = 0.5;
+        let maxChange = 0;
+        
+        // Simple diagonal update (could use full matrix inversion)
+        for (let j = 0; j < p; j++) {
+            if (Math.abs(hessian[j][j]) > 1e-8) {
+                const update = -score[j] / hessian[j][j];
+                const clippedUpdate = Math.max(-maxStepSize, Math.min(maxStepSize, update));
+                this.beta[j] += clippedUpdate;
+                maxChange = Math.max(maxChange, Math.abs(clippedUpdate));
+            }
+        }
+        
+        return maxChange;
+    }
+    
+    predict(X) {
+        const XDesign = this.createDesignMatrix(X);
+        const predictions = [];
+        
+        for (let i = 0; i < XDesign.length; i++) {
+            const eta = this.linearPredictor(XDesign[i]);
+            const prob = logistic(eta);
+            predictions.push(Math.max(0.01, Math.min(0.99, prob)));
+        }
+        
+        return predictions;
+    }
+}
+
+/**
+ * Weighted linear regression for outcome models
+ */
+class WeightedLinearRegression extends ScoreModel {
+    constructor(options = {}) {
+        super('linear', 'outcome');
+        this.lambda = options.lambda || 0.001;
+        this.includeSquaredTerms = options.includeSquaredTerms || false;
+        this.includeInteractions = options.includeInteractions || false;
+    }
+    
+    fit(X, Y, weights, options = {}) {
+        const XDesign = this.createDesignMatrix(X);
+        const p = XDesign[0].length;
+        
+        // Weighted normal equations: (X'WX + λI)β = X'WY
+        const XtWX = Array(p).fill().map(() => Array(p).fill(0));
+        const XtWY = Array(p).fill(0);
+        
+        for (let i = 0; i < X.length; i++) {
+            const xi = XDesign[i];
+            const w = weights[i];
+            
+            for (let j = 0; j < p; j++) {
+                XtWY[j] += w * xi[j] * Y[i];
+                for (let k = 0; k < p; k++) {
+                    XtWX[j][k] += w * xi[j] * xi[k];
+                    if (j === k && j > 0) XtWX[j][k] += this.lambda;
+                }
+            }
+        }
+        
+        // Solve using Gauss-Seidel iteration
+        this.beta = this.solveWeightedNormal(XtWX, XtWY);
+        
+        return this;
+    }
+    
+    createDesignMatrix(X) {
+        const n = X.length;
+        const p = X[0].length;
+        const XDesign = [];
+        
+        for (let i = 0; i < n; i++) {
+            const row = [1, ...X[i]]; // Intercept + main effects
+            
+            if (this.includeSquaredTerms) {
+                // Add squared terms for first 3 covariates
+                for (let j = 0; j < Math.min(3, p); j++) {
+                    row.push(X[i][j] * X[i][j]);
+                }
+            }
+            
+            if (this.includeInteractions && p >= 2) {
+                row.push(X[i][0] * X[i][1]);
+                if (p >= 3) {
+                    row.push(X[i][0] * X[i][2]);
+                }
+            }
+            
+            XDesign.push(row);
+        }
+        
+        return XDesign;
+    }
+    
+    solveWeightedNormal(XtWX, XtWY) {
+        const p = XtWY.length;
+        const beta = Array(p).fill(0);
+        const maxIter = 100;
+        const tolerance = 1e-6;
+        
+        for (let iter = 0; iter < maxIter; iter++) {
+            let maxChange = 0;
+            
+            for (let j = 0; j < p; j++) {
+                if (Math.abs(XtWX[j][j]) > 1e-8) {
+                    let sum = XtWY[j];
+                    for (let k = 0; k < p; k++) {
+                        if (k !== j) {
+                            sum -= XtWX[j][k] * beta[k];
+                        }
+                    }
+                    const newBeta = sum / XtWX[j][j];
+                    maxChange = Math.max(maxChange, Math.abs(newBeta - beta[j]));
+                    beta[j] = newBeta;
+                }
+            }
+            
+            if (maxChange < tolerance) break;
+        }
+        
+        return beta;
+    }
+    
+    predict(X) {
+        const XDesign = this.createDesignMatrix(X);
+        const predictions = [];
+        
+        for (let i = 0; i < XDesign.length; i++) {
+            let pred = 0;
+            for (let j = 0; j < Math.min(XDesign[i].length, this.beta.length); j++) {
+                pred += this.beta[j] * XDesign[i][j];
+            }
+            predictions.push(pred);
+        }
+        
+        return predictions;
+    }
+}
+
+// ============================================================================
+// MAIN WDSM CLASS
+// ============================================================================
+
+class SurveyWeightedDSM {
+    constructor(options = {}) {
+        // Matching parameters
+        this.K = options.K || 3;
+        this.caliper = options.caliper || 0.15;
+        this.distance = options.distance || 'euclidean';
+        
+        // Estimation parameters
+        this.biasCorrection = options.biasCorrection !== false;
+        this.crossFittingFolds = options.crossFittingFolds || 5;
+        
+        // Bootstrap parameters
+        this.bootstrapReps = options.bootstrapReps || 200;
+        this.bootstrapMethod = options.bootstrapMethod || 'exponential';
+        
+        // Model specifications
+        this.propensityModels = options.propensityModels || [
+            new WeightedLogisticRegression(),
+            new WeightedLogisticRegression({ includeInteractions: true })
+        ];
+        
+        this.outcomeModels = options.outcomeModels || [
+            new WeightedLinearRegression(),
+            new WeightedLinearRegression({ includeSquaredTerms: true }),
+            new WeightedLinearRegression({ includeInteractions: true })
+        ];
+        
+        // Verbose output
+        this.verbose = options.verbose || false;
+    }
+    
+    /**
+     * Main estimation method
+     */
+    estimate(data) {
+        const { X, Y, T, weights } = data;
+        const n = X.length;
+        
+        if (this.verbose) {
+            console.log(`WDSM: Starting estimation with n=${n}, K=${this.K}`);
+            console.log(`Effective sample size: ${effectiveSampleSize(weights).toFixed(1)}`);
+        }
+        
+        // Stage 1: Estimate scores with cross-fitting
+        const scores = this.estimateScoresWithCrossFitting(X, Y, T, weights);
+        
+        // Stage 2: Perform matching (NO weights in distance)
+        const matchResults = this.performMatching(X, T, scores, weights);
+        
+        // Stage 3: Impute outcomes with bias correction
+        const imputedOutcomes = this.imputeOutcomes(Y, T, X, matchResults, scores);
+        
+        // Stage 4: Calculate weighted estimates
+        const estimates = this.calculateEstimates(imputedOutcomes, T, weights);
+        
+        // Stage 5: Estimate variance via bootstrap
+        let variance = null;
+        if (this.bootstrapReps > 0) {
+            variance = this.bootstrapVariance(data);
+        }
+        
+        // Stage 6: Calculate diagnostics
+        const diagnostics = this.calculateDiagnostics(X, T, weights, scores, matchResults);
+        
+        return {
+            estimates: estimates,
+            variance: variance,
+            diagnostics: diagnostics,
+            scores: scores,
+            imputedOutcomes: imputedOutcomes
+        };
+    }
+    
+    /**
+     * Stage 1: Score estimation with cross-fitting
+     */
+    estimateScoresWithCrossFitting(X, Y, T, weights) {
+        const n = X.length;
+        const K = this.crossFittingFolds;
+        
+        if (this.verbose) {
+            console.log(`Stage 1: Estimating scores with ${K}-fold cross-fitting...`);
+        }
+        
+        // Initialize score arrays
+        const propensityScores = Array(n).fill(0);
+        const prognosticScores0 = Array(n).fill(0);
+        const prognosticScores1 = Array(n).fill(0);
+        
+        // Create fold assignments
+        const folds = Array(n).fill(0).map((_, i) => i % K);
+        
+        // Cross-fitting procedure
+        for (let k = 0; k < K; k++) {
+            const trainIdx = [];
+            const testIdx = [];
+            
+            for (let i = 0; i < n; i++) {
+                if (folds[i] === k) {
+                    testIdx.push(i);
+                } else {
+                    trainIdx.push(i);
+                }
+            }
+            
+            if (trainIdx.length < 20) continue; // Skip if insufficient training data
+            
+            // Extract training data
+            const XTrain = trainIdx.map(i => X[i]);
+            const YTrain = trainIdx.map(i => Y[i]);
+            const TTrain = trainIdx.map(i => T[i]);
+            const wTrain = trainIdx.map(i => weights[i]);
+            
+            // Fit and select best propensity score model
+            const bestPropModel = this.selectBestModel(
+                this.propensityModels, XTrain, TTrain, wTrain, 'propensity'
+            );
+            
+            // Fit outcome models separately by treatment group
+            const idx0 = TTrain.map((t, i) => t === 0 ? i : -1).filter(i => i >= 0);
+            const idx1 = TTrain.map((t, i) => t === 1 ? i : -1).filter(i => i >= 0);
+            
+            let bestOutModel0 = null, bestOutModel1 = null;
+            
+            if (idx0.length > 10) {
+                const X0 = idx0.map(i => XTrain[i]);
+                const Y0 = idx0.map(i => YTrain[i]);
+                const w0 = idx0.map(i => wTrain[i]);
+                bestOutModel0 = this.selectBestModel(
+                    this.outcomeModels, X0, Y0, w0, 'outcome'
+                );
+            }
+            
+            if (idx1.length > 10) {
+                const X1 = idx1.map(i => XTrain[i]);
+                const Y1 = idx1.map(i => YTrain[i]);
+                const w1 = idx1.map(i => wTrain[i]);
+                bestOutModel1 = this.selectBestModel(
+                    this.outcomeModels, X1, Y1, w1, 'outcome'
+                );
+            }
+            
+            // Predict on test fold
+            const XTest = testIdx.map(i => X[i]);
+            
+            if (bestPropModel) {
+                const propPred = bestPropModel.predict(XTest);
+                for (let j = 0; j < testIdx.length; j++) {
+                    propensityScores[testIdx[j]] = propPred[j];
+                }
+            }
+            
+            if (bestOutModel0) {
+                const prog0Pred = bestOutModel0.predict(XTest);
+                for (let j = 0; j < testIdx.length; j++) {
+                    prognosticScores0[testIdx[j]] = prog0Pred[j];
+                }
+            }
+            
+            if (bestOutModel1) {
+                const prog1Pred = bestOutModel1.predict(XTest);
+                for (let j = 0; j < testIdx.length; j++) {
+                    prognosticScores1[testIdx[j]] = prog1Pred[j];
+                }
+            }
+        }
+        
+        return {
+            propensity: propensityScores,
+            prognostic0: prognosticScores0,
+            prognostic1: prognosticScores1
+        };
+    }
+    
+    /**
+     * Select best model using weighted cross-validation
+     */
+    selectBestModel(models, X, Y, weights, type) {
+        let bestModel = null;
+        let bestScore = Infinity;
+        
+        for (const model of models) {
+            try {
+                const score = this.crossValidateModel(model, X, Y, weights, type);
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestModel = model;
+                }
+            } catch (e) {
+                // Skip failed models
+                continue;
+            }
+        }
+        
+        // Refit best model on full data
+        if (bestModel) {
+            bestModel.fit(X, Y, weights);
+        }
+        
+        return bestModel;
+    }
+    
+    /**
+     * Cross-validate a single model
+     */
+    crossValidateModel(model, X, Y, weights, type) {
+        const n = X.length;
+        const K = 3; // Internal CV folds
+        let totalScore = 0;
+        let totalWeight = 0;
+        
+        for (let k = 0; k < K; k++) {
+            const trainIdx = [];
+            const valIdx = [];
+            
+            for (let i = 0; i < n; i++) {
+                if (i % K === k) {
+                    valIdx.push(i);
+                } else {
+                    trainIdx.push(i);
+                }
+            }
+            
+            if (trainIdx.length < 10 || valIdx.length < 5) continue;
+            
+            // Fit on training
+            const XTrain = trainIdx.map(i => X[i]);
+            const YTrain = trainIdx.map(i => Y[i]);
+            const wTrain = trainIdx.map(i => weights[i]);
+            
+            const fitModel = Object.create(model);
+            fitModel.fit(XTrain, YTrain, wTrain);
+            
+            // Evaluate on validation
+            const XVal = valIdx.map(i => X[i]);
+            const YVal = valIdx.map(i => Y[i]);
+            const wVal = valIdx.map(i => weights[i]);
+            
+            const predictions = fitModel.predict(XVal);
+            
+            // Calculate weighted loss
+            for (let i = 0; i < valIdx.length; i++) {
+                const loss = type === 'propensity' ?
+                    -YVal[i] * Math.log(predictions[i]) - (1 - YVal[i]) * Math.log(1 - predictions[i]) :
+                    Math.pow(YVal[i] - predictions[i], 2);
+                
+                totalScore += wVal[i] * loss;
+                totalWeight += wVal[i];
+            }
+        }
+        
+        return totalWeight > 0 ? totalScore / totalWeight : Infinity;
+    }
+    
+    /**
+     * Stage 2: Matching without survey weights in distance
+     */
+    performMatching(X, T, scores, weights) {
+        const n = X.length;
+        const { propensity, prognostic0, prognostic1 } = scores;
+        
+        if (this.verbose) {
+            console.log(`Stage 2: Performing matching with K=${this.K}, caliper=${this.caliper}...`);
+        }
+        
+        // Create standardized double scores
+        const doubleScores = this.createStandardizedDoubleScores(
+            propensity, prognostic0, prognostic1, weights
+        );
+        
+        // Initialize match results
+        const matches = Array(n).fill().map(() => []);
+        const matchDistances = Array(n).fill().map(() => []);
+        let totalMatched = 0;
+        
+        // Perform matching for each unit
+        for (let i = 0; i < n; i++) {
+            const candidates = [];
+            
+            // Find potential matches
+            for (let j = 0; j < n; j++) {
+                if (T[i] !== T[j]) {
+                    // Check propensity score caliper
+                    if (Math.abs(propensity[i] - propensity[j]) <= this.caliper) {
+                        // Calculate distance (NO WEIGHTS!)
+                        const dist = this.calculateDistance(
+                            doubleScores.standardized[i],
+                            doubleScores.standardized[j]
+                        );
+                        
+                        candidates.push({ idx: j, dist: dist });
+                    }
+                }
+            }
+            
+            // Sort by distance and select K nearest
+            candidates.sort((a, b) => a.dist - b.dist);
+            const selected = candidates.slice(0, this.K);
+            
+            if (selected.length > 0) {
+                matches[i] = selected.map(s => s.idx);
+                matchDistances[i] = selected.map(s => s.dist);
+                totalMatched++;
+            }
+        }
+        
+        return {
+            matches: matches,
+            distances: matchDistances,
+            matchRate: totalMatched / n,
+            doubleScores: doubleScores
+        };
+    }
+    
+    /**
+     * Create standardized double scores
+     */
+    createStandardizedDoubleScores(propensity, prognostic0, prognostic1, weights) {
+        const n = propensity.length;
+        
+        // Stack scores into matrix
+        const rawScores = [];
+        for (let i = 0; i < n; i++) {
+            rawScores.push([propensity[i], prognostic0[i], prognostic1[i]]);
+        }
+        
+        // Calculate weighted means
+        const means = [
+            weightedMean(propensity, weights),
+            weightedMean(prognostic0, weights),
+            weightedMean(prognostic1, weights)
+        ];
+        
+        // Calculate weighted covariance matrix
+        const centered = rawScores.map(s => [
+            s[0] - means[0],
+            s[1] - means[1],
+            s[2] - means[2]
+        ]);
+        
+        const cov = weightedCovariance(centered, weights);
+        
+        // Standardize scores (simple diagonal standardization)
+        const stds = [
+            Math.sqrt(cov[0][0]) + 1e-6,
+            Math.sqrt(cov[1][1]) + 1e-6,
+            Math.sqrt(cov[2][2]) + 1e-6
+        ];
+        
+        const standardized = rawScores.map(s => [
+            (s[0] - means[0]) / stds[0],
+            (s[1] - means[1]) / stds[1],
+            (s[2] - means[2]) / stds[2]
+        ]);
+        
+        return {
+            raw: rawScores,
+            standardized: standardized,
+            means: means,
+            stds: stds,
+            covariance: cov
+        };
+    }
+    
+    /**
+     * Calculate distance between double scores
+     */
+    calculateDistance(score1, score2) {
+        if (this.distance === 'euclidean') {
+            let dist = 0;
+            for (let k = 0; k < score1.length; k++) {
+                dist += Math.pow(score1[k] - score2[k], 2);
+            }
+            return Math.sqrt(dist);
+        } else if (this.distance === 'manhattan') {
+            let dist = 0;
+            for (let k = 0; k < score1.length; k++) {
+                dist += Math.abs(score1[k] - score2[k]);
+            }
+            return dist;
+        } else {
+            throw new Error(`Unknown distance metric: ${this.distance}`);
+        }
+    }
+    
+    /**
+     * Stage 3: Impute outcomes with bias correction
+     */
+    imputeOutcomes(Y, T, X, matchResults, scores) {
+        const n = Y.length;
+        const { matches } = matchResults;
+        const { prognostic0, prognostic1 } = scores;
+        
+        if (this.verbose) {
+            console.log(`Stage 3: Imputing outcomes with bias correction=${this.biasCorrection}...`);
+        }
+        
+        // Initialize imputed outcomes
+        const Y0_imputed = Array(n).fill(NaN);
+        const Y1_imputed = Array(n).fill(NaN);
+        
+        // Fill in observed outcomes
+        for (let i = 0; i < n; i++) {
+            if (T[i] === 0) {
+                Y0_imputed[i] = Y[i];
+            } else {
+                Y1_imputed[i] = Y[i];
+            }
+        }
+        
+        // Impute counterfactual outcomes
+        for (let i = 0; i < n; i++) {
+            if (matches[i].length > 0) {
+                // Calculate matched outcome
+                let matchedOutcome = 0;
+                for (const j of matches[i]) {
+                    matchedOutcome += Y[j];
+                }
+                matchedOutcome /= matches[i].length;
+                
+                // Apply bias correction if requested
+                if (this.biasCorrection) {
+                    let biasCorrection = 0;
+                    
+                    if (T[i] === 0) {
+                        // Imputing Y(1)
+                        const myPrognostic = prognostic1[i];
+                        let matchPrognostic = 0;
+                        for (const j of matches[i]) {
+                            matchPrognostic += prognostic1[j];
+                        }
+                        matchPrognostic /= matches[i].length;
+                        biasCorrection = myPrognostic - matchPrognostic;
+                        
+                        Y1_imputed[i] = matchedOutcome + biasCorrection;
+                    } else {
+                        // Imputing Y(0)
+                        const myPrognostic = prognostic0[i];
+                        let matchPrognostic = 0;
+                        for (const j of matches[i]) {
+                            matchPrognostic += prognostic0[j];
+                        }
+                        matchPrognostic /= matches[i].length;
+                        biasCorrection = myPrognostic - matchPrognostic;
+                        
+                        Y0_imputed[i] = matchedOutcome + biasCorrection;
+                    }
+                } else {
+                    // No bias correction
+                    if (T[i] === 0) {
+                        Y1_imputed[i] = matchedOutcome;
+                    } else {
+                        Y0_imputed[i] = matchedOutcome;
+                    }
+                }
+            } else {
+                // No matches found - use prognostic score
+                if (T[i] === 0) {
+                    Y1_imputed[i] = prognostic1[i];
+                } else {
+                    Y0_imputed[i] = prognostic0[i];
+                }
+            }
+        }
+        
+        return {
+            Y0: Y0_imputed,
+            Y1: Y1_imputed
+        };
+    }
+    
+    /**
+     * Stage 4: Calculate weighted estimates
+     */
+    calculateEstimates(imputedOutcomes, T, weights) {
+        const n = T.length;
+        const { Y0, Y1 } = imputedOutcomes;
+        
+        if (this.verbose) {
+            console.log('Stage 4: Calculating weighted estimates...');
+        }
+        
+        // Initialize accumulators
+        let sumW = 0, sumW_ATE = 0;
+        let sumW_T1 = 0, sumW_ATT = 0;
+        let sumW_T0 = 0, sumW_ATC = 0;
+        let validUnits = 0;
+        
+        // Individual treatment effects
+        const ITE = [];
+        
+        for (let i = 0; i < n; i++) {
+            if (!isNaN(Y0[i]) && !isNaN(Y1[i])) {
+                const effect = Y1[i] - Y0[i];
+                ITE.push(effect);
+                
+                // ATE
+                sumW += weights[i];
+                sumW_ATE += weights[i] * effect;
+                
+                // ATT
+                if (T[i] === 1) {
+                    sumW_T1 += weights[i];
+                    sumW_ATT += weights[i] * effect;
+                }
+                
+                // ATC
+                if (T[i] === 0) {
+                    sumW_T0 += weights[i];
+                    sumW_ATC += weights[i] * effect;
+                }
+                
+                validUnits++;
+            } else {
+                ITE.push(NaN);
+            }
+        }
+        
+        // Calculate estimates
+        const ATE = sumW > 0 ? sumW_ATE / sumW : NaN;
+        const ATT = sumW_T1 > 0 ? sumW_ATT / sumW_T1 : NaN;
+        const ATC = sumW_T0 > 0 ? sumW_ATC / sumW_T0 : NaN;
+        
+        // Calculate quantile treatment effects
+        const validITE = [];
+        const validWeights = [];
+        for (let i = 0; i < n; i++) {
+            if (!isNaN(ITE[i])) {
+                validITE.push(ITE[i]);
+                validWeights.push(weights[i]);
+            }
+        }
+        
+        const QTE = {};
+        const quantiles = [0.25, 0.5, 0.75];
+        for (const q of quantiles) {
+            // Calculate quantiles of Y(1) and Y(0)
+            const Y0_valid = [], Y1_valid = [], w_valid = [];
+            for (let i = 0; i < n; i++) {
+                if (!isNaN(Y0[i]) && !isNaN(Y1[i])) {
+                    Y0_valid.push(Y0[i]);
+                    Y1_valid.push(Y1[i]);
+                    w_valid.push(weights[i]);
+                }
+            }
+            
+            const q0 = weightedQuantile(Y0_valid, w_valid, q);
+            const q1 = weightedQuantile(Y1_valid, w_valid, q);
+            
+            QTE[q] = {
+                effect: q1 - q0,
+                Y0_quantile: q0,
+                Y1_quantile: q1
+            };
+        }
+        
+        return {
+            ATE: ATE,
+            ATT: ATT,
+            ATC: ATC,
+            QTE: QTE,
+            ITE: ITE,
+            validUnits: validUnits,
+            effectiveSampleSize: effectiveSampleSize(weights)
+        };
+    }
+    
+    /**
+     * Stage 5: Bootstrap variance estimation
+     */
+    bootstrapVariance(data) {
+        const { X, Y, T, weights } = data;
+        const n = X.length;
+        
+        if (this.verbose) {
+            console.log(`Stage 5: Bootstrap variance estimation (B=${this.bootstrapReps})...`);
+        }
+        
+        const bootstrapEstimates = {
+            ATE: [],
+            ATT: [],
+            ATC: []
+        };
+        
+        // Progress tracking
+        const progressInterval = Math.floor(this.bootstrapReps / 10);
+        
+        for (let b = 0; b < this.bootstrapReps; b++) {
+            if (this.verbose && b % progressInterval === 0 && b > 0) {
+                console.log(`  Bootstrap progress: ${b}/${this.bootstrapReps}`);
+            }
+            
+            try {
+                // Generate bootstrap weights
+                const bootWeights = this.generateBootstrapWeights(weights);
+                
+                // Create bootstrap data
+                const bootData = {
+                    X: X,
+                    Y: Y,
+                    T: T,
+                    weights: bootWeights
+                };
+                
+                // Apply WDSM
+                const bootResult = this.estimate(bootData);
+                
+                // Store estimates
+                if (!isNaN(bootResult.estimates.ATE)) {
+                    bootstrapEstimates.ATE.push(bootResult.estimates.ATE);
+                }
+                if (!isNaN(bootResult.estimates.ATT)) {
+                    bootstrapEstimates.ATT.push(bootResult.estimates.ATT);
+                }
+                if (!isNaN(bootResult.estimates.ATC)) {
+                    bootstrapEstimates.ATC.push(bootResult.estimates.ATC);
+                }
+                
+            } catch (e) {
+                // Skip failed bootstrap iterations
+                continue;
+            }
+        }
+        
+        // Calculate variance estimates
+        const variance = {};
+        
+        for (const [estimand, estimates] of Object.entries(bootstrapEstimates)) {
+            if (estimates.length > 1) {
+                const mean = estimates.reduce((a, b) => a + b, 0) / estimates.length;
+                const v = estimates.reduce((sum, x) => sum + Math.pow(x - mean, 2), 0) / (estimates.length - 1);
+                const se = Math.sqrt(v);
+                
+                // Percentile confidence intervals
+                const sorted = estimates.slice().sort((a, b) => a - b);
+                const lower = sorted[Math.floor(0.025 * sorted.length)];
+                const upper = sorted[Math.floor(0.975 * sorted.length)];
+                
+                variance[estimand] = {
+                    variance: v,
+                    standardError: se,
+                    confidenceInterval: [lower, upper],
+                    bootstrapReps: estimates.length
+                };
+            }
+        }
+        
+        return variance;
+    }
+    
+    /**
+     * Generate bootstrap weights
+     */
+    generateBootstrapWeights(weights) {
+        const n = weights.length;
+        const bootWeights = [];
+        
+        if (this.bootstrapMethod === 'exponential') {
+            // Exponential weights (Bayesian bootstrap)
+            for (let i = 0; i < n; i++) {
+                bootWeights.push(weights[i] * exponentialRandom());
+            }
+        } else if (this.bootstrapMethod === 'multinomial') {
+            // Multinomial resampling
+            const counts = Array(n).fill(0);
+            for (let i = 0; i < n; i++) {
+                const idx = Math.floor(Math.random() * n);
+                counts[idx]++;
+            }
+            for (let i = 0; i < n; i++) {
+                bootWeights.push(weights[i] * counts[i]);
+            }
+        }
+        
+        // Normalize to maintain total weight
+        const sumOriginal = weights.reduce((a, b) => a + b, 0);
+        const sumBoot = bootWeights.reduce((a, b) => a + b, 0);
+        
+        return bootWeights.map(w => w * sumOriginal / sumBoot);
+    }
+    
+    /**
+     * Calculate diagnostics
+     */
+    calculateDiagnostics(X, T, weights, scores, matchResults) {
+        const n = X.length;
+        const p = X[0].length;
+        
+        if (this.verbose) {
+            console.log('Calculating diagnostics...');
+        }
+        
+        // Covariate balance
+        const balance = {
+            beforeMatching: [],
+            afterMatching: []
+        };
+        
+        // Calculate standardized differences before matching
+        for (let j = 0; j < p; j++) {
+            const treated = [];
+            const control = [];
+            const treatedWeights = [];
+            const controlWeights = [];
+            
+            for (let i = 0; i < n; i++) {
+                if (T[i] === 1) {
+                    treated.push(X[i][j]);
+                    treatedWeights.push(weights[i]);
+                } else {
+                    control.push(X[i][j]);
+                    controlWeights.push(weights[i]);
+                }
+            }
+            
+            const meanTreated = weightedMean(treated, treatedWeights);
+            const meanControl = weightedMean(control, controlWeights);
+            const varTreated = weightedVariance(treated, treatedWeights);
+            const varControl = weightedVariance(control, controlWeights);
+            
+            const pooledSD = Math.sqrt((varTreated + varControl) / 2);
+            const stdDiff = pooledSD > 0 ? Math.abs(meanTreated - meanControl) / pooledSD : 0;
+            
+            balance.beforeMatching.push({
+                covariate: j,
+                standardizedDifference: stdDiff,
+                meanTreated: meanTreated,
+                meanControl: meanControl
+            });
+        }
+        
+        // Propensity score overlap
+        const propensityOverlap = this.assessPropensityOverlap(scores.propensity, T, weights);
+        
+        // Match quality
+        const matchQuality = {
+            matchRate: matchResults.matchRate,
+            averageMatchesPerUnit: matchResults.matches.reduce((sum, m) => sum + m.length, 0) / n,
+            averageMatchDistance: this.calculateAverageMatchDistance(matchResults)
+        };
+        
+        return {
+            balance: balance,
+            propensityOverlap: propensityOverlap,
+            matchQuality: matchQuality,
+            effectiveSampleSize: effectiveSampleSize(weights),
+            designEffect: this.calculateDesignEffect(weights)
+        };
+    }
+    
+    /**
+     * Assess propensity score overlap
+     */
+    assessPropensityOverlap(propensity, T, weights) {
+        const treated = [];
+        const control = [];
+        const treatedWeights = [];
+        const controlWeights = [];
+        
+        for (let i = 0; i < propensity.length; i++) {
+            if (T[i] === 1) {
+                treated.push(propensity[i]);
+                treatedWeights.push(weights[i]);
+            } else {
+                control.push(propensity[i]);
+                controlWeights.push(weights[i]);
+            }
+        }
+        
+        // Calculate weighted quantiles
+        const quantiles = [0.05, 0.25, 0.5, 0.75, 0.95];
+        const treatedQuantiles = {};
+        const controlQuantiles = {};
+        
+        for (const q of quantiles) {
+            treatedQuantiles[q] = weightedQuantile(treated, treatedWeights, q);
+            controlQuantiles[q] = weightedQuantile(control, controlWeights, q);
+        }
+        
+        // Calculate overlap region
+        const overlapMin = Math.max(
+            weightedQuantile(treated, treatedWeights, 0.05),
+            weightedQuantile(control, controlWeights, 0.05)
+        );
+        const overlapMax = Math.min(
+            weightedQuantile(treated, treatedWeights, 0.95),
+            weightedQuantile(control, controlWeights, 0.95)
+        );
+        
+        return {
+            treatedQuantiles: treatedQuantiles,
+            controlQuantiles: controlQuantiles,
+            overlapRegion: [overlapMin, overlapMax],
+            overlapProportion: (overlapMax - overlapMin) / 0.9 // Approximate
+        };
+    }
+    
+    /**
+     * Calculate average match distance
+     */
+    calculateAverageMatchDistance(matchResults) {
+        const { distances } = matchResults;
+        let totalDist = 0;
+        let totalMatches = 0;
+        
+        for (const matchDists of distances) {
+            for (const dist of matchDists) {
+                totalDist += dist;
+                totalMatches++;
+            }
+        }
+        
+        return totalMatches > 0 ? totalDist / totalMatches : NaN;
+    }
+    
+    /**
+     * Calculate design effect
+     */
+    calculateDesignEffect(weights) {
+        const n = weights.length;
+        const sumW = weights.reduce((a, b) => a + b, 0);
+        const sumW2 = weights.reduce((sum, w) => sum + w * w, 0);
+        return n * sumW2 / (sumW * sumW);
+    }
+}
+
+// ============================================================================
+// EXAMPLE USAGE AND TESTING
+// ============================================================================
+
+/**
+ * Generate example survey data for testing
+ */
+function generateExampleData(n = 500, scenario = 'moderate') {
+    console.log(`Generating example data: n=${n}, scenario=${scenario}`);
+    
+    // Generate covariates
+    const X = [];
+    for (let i = 0; i < n; i++) {
+        X.push([
+            Math.random() < 0.5 ? 1 : 0,  // Binary
+            normalRandom(),               // Continuous
+            normalRandom(),               // Continuous
+            normalRandom()                // Continuous
+        ]);
+    }
+    
+    // Generate treatment
+    const T = [];
+    for (let i = 0; i < n; i++) {
+        let logitP = 0.5 * X[i][0] + 0.8 * X[i][1] - 0.3 * X[i][2];
+        T.push(Math.random() < logistic(logitP) ? 1 : 0);
+    }
+    
+    // Generate outcomes
+    const Y = [];
+    for (let i = 0; i < n; i++) {
+        const baseline = 1.0 + 0.8 * X[i][0] + 1.2 * X[i][1] - 0.6 * X[i][2];
+        const effect = T[i] === 1 ? 2.0 : 0;
+        Y.push(baseline + effect + 0.5 * normalRandom());
+    }
+    
+    // Generate survey weights
+    const weights = [];
+    if (scenario === 'uniform') {
+        for (let i = 0; i < n; i++) weights.push(1.0);
+    } else {
+        for (let i = 0; i < n; i++) {
+            const logitW = 0.5 * X[i][0] + 0.8 * X[i][1];
+            const selProb = logistic(logitW);
+            weights.push(1 / Math.max(0.1, selProb));
+        }
+    }
+    
+    // Normalize weights
+    const sumW = weights.reduce((a, b) => a + b, 0);
+    const normalizedWeights = weights.map(w => w * n / sumW);
+    
+    return {
+        X: X,
+        Y: Y,
+        T: T,
+        weights: normalizedWeights
+    };
+}
+
+/**
+ * Run example analysis
+ */
+function runExample() {
+    console.log('=== SURVEY-WEIGHTED DOUBLE SCORE MATCHING EXAMPLE ===\n');
+    
+    // Generate data
+    const data = generateExampleData(400, 'moderate');
+    
+    // Create WDSM estimator
+    const wdsm = new SurveyWeightedDSM({
+        K: 3,
+        caliper: 0.15,
+        biasCorrection: true,
+        crossFittingFolds: 5,
+        bootstrapReps: 50,
+        verbose: true
+    });
+    
+    // Run estimation
+    console.log('\nRunning WDSM estimation...\n');
+    const result = wdsm.estimate(data);
+    
+    // Display results
+    console.log('\n=== RESULTS ===\n');
+    console.log('Point Estimates:');
+    console.log(`  ATE: ${result.estimates.ATE.toFixed(3)}`);
+    console.log(`  ATT: ${result.estimates.ATT.toFixed(3)}`);
+    console.log(`  ATC: ${result.estimates.ATC.toFixed(3)}`);
+    
+    console.log('\nQuantile Treatment Effects:');
+    for (const [q, qte] of Object.entries(result.estimates.QTE)) {
+        console.log(`  τ(${q}): ${qte.effect.toFixed(3)}`);
+    }
+    
+    if (result.variance) {
+        console.log('\nVariance Estimates:');
+        console.log(`  ATE SE: ${result.variance.ATE.standardError.toFixed(3)}`);
+        console.log(`  ATE 95% CI: [${result.variance.ATE.confidenceInterval[0].toFixed(3)}, ${result.variance.ATE.confidenceInterval[1].toFixed(3)}]`);
+    }
+    
+    console.log('\nDiagnostics:');
+    console.log(`  Match rate: ${(result.diagnostics.matchQuality.matchRate * 100).toFixed(1)}%`);
+    console.log(`  Effective sample size: ${result.diagnostics.effectiveSampleSize.toFixed(1)}`);
+    console.log(`  Design effect: ${result.diagnostics.designEffect.toFixed(2)}`);
+    console.log(`  Propensity overlap: ${(result.diagnostics.propensityOverlap.overlapProportion * 100).toFixed(1)}%`);
+    
+    console.log('\nCovariate Balance (Standardized Differences):');
+    for (const bal of result.diagnostics.balance.beforeMatching) {
+        console.log(`  X${bal.covariate}: ${bal.standardizedDifference.toFixed(3)}`);
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        SurveyWeightedDSM,
+        WeightedLogisticRegression,
+        WeightedLinearRegression,
+        generateExampleData,
+        runExample,
+        // Utility functions
+        normalRandom,
+        exponentialRandom,
+        weightedMean,
+        weightedVariance,
+        weightedQuantile,
+        effectiveSampleSize
+    };
+}
+
+// Run example if called directly
+if (typeof window !== 'undefined') {
+    console.log('WDSM loaded. Call runExample() to see demonstration.');
+} else if (typeof require !== 'undefined' && require.main === module) {
+    runExample();
+}
